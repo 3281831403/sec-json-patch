@@ -2,6 +2,7 @@
 
 from .apply import (
     PatchError,
+    PatchTestError,
     apply_op,
     apply_patch,
     diff_docs,
@@ -14,6 +15,7 @@ from .apply import (
 
 __all__ = [
     "PatchError",
+    "PatchTestError",
     "parse_pointer",
     "resolve",
     "apply_op",

@@ -1,4 +1,13 @@
-"""Patch application primitives for the configuration service."""
+"""Patch application primitives for the configuration service.
+
+The module implements RFC 6901 pointer resolution and RFC 6902 style
+operations.  Two invariants are guaranteed:
+
+* :func:`apply_patch` is atomic: it never mutates its input, and when any
+  operation fails the caller's document is left exactly as it was.
+* Pointer tokens are decoded, so ``~1`` can only ever address a literal
+  ``/`` inside a single object key and never a deeper path.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +20,33 @@ class PatchError(ValueError):
     """Raised when a patch or a pointer cannot be applied."""
 
 
+class PatchTestError(PatchError, AssertionError):
+    """Raised when a ``test`` operation does not match the document.
+
+    It derives from both :class:`PatchError` and :class:`AssertionError` so
+    callers written against either convention keep working.
+    """
+
+
 _INDEX_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_INVALID_ESCAPE_RE = re.compile(r"~(?:[^01]|$)")
 _OPERATIONS = {"add", "remove", "replace", "move", "copy", "test"}
+_APPEND_TOKEN = "-"
+
+
+def _decode_token(token: str) -> str:
+    """Decode a single RFC 6901 reference token.
+
+    ``~1`` is turned into ``/`` and ``~0`` into ``~`` (in that order so that
+    ``~01`` decodes to ``~1``).  Any other ``~`` sequence is invalid and is
+    rejected instead of being treated as a literal key, which closes the
+    path-traversal hole.
+    """
+    if not isinstance(token, str):
+        raise PatchError("pointer tokens must be strings")
+    if _INVALID_ESCAPE_RE.search(token):
+        raise PatchError("pointer contains an invalid escape sequence")
+    return token.replace("~1", "/").replace("~0", "~")
 
 
 def parse_pointer(text: str) -> list:
@@ -23,7 +57,7 @@ def parse_pointer(text: str) -> list:
         return []
     if not text.startswith("/"):
         raise PatchError("pointer must start with a slash")
-    return text.split("/")[1:]
+    return [_decode_token(token) for token in text.split("/")[1:]]
 
 
 def _as_parts(pointer: Any) -> list:
@@ -35,12 +69,18 @@ def _as_parts(pointer: Any) -> list:
     return parse_pointer(pointer)
 
 
-def _array_index(token: str, length: int, allow_end: bool) -> int:
+def _array_index(token: str, length: int, allow_end: bool = False) -> int:
+    """Validate an array index token and return it as an int.
+
+    ``allow_end`` permits ``index == length`` which is the insertion point
+    just past the last element; the ``-`` append token is handled by the
+    callers because it is only meaningful for ``add``.
+    """
     if not isinstance(token, str) or _INDEX_RE.fullmatch(token) is None:
         raise PatchError("invalid array index")
     index = int(token)
-    limit = length - 1
-    if index > limit:
+    limit = length if allow_end else length - 1
+    if index < 0 or index > limit:
         raise PatchError("array index out of range")
     return index
 
@@ -83,7 +123,13 @@ def _add_inplace(doc: Any, parts: list, value: Any) -> None:
         parent[token] = copy.deepcopy(value)
         return
     if isinstance(parent, list):
-        index = _array_index(token, len(parent), True)
+        if token == _APPEND_TOKEN:
+            # ``-`` appends after the last element and never shifts.
+            parent.append(copy.deepcopy(value))
+            return
+        # A numeric index inserts *before* the addressed element; this is
+        # deliberately distinct from the append semantics of ``-``.
+        index = _array_index(token, len(parent), allow_end=True)
         parent.insert(index, copy.deepcopy(value))
         return
     raise PatchError("cannot add a member to a scalar value")
@@ -93,17 +139,13 @@ def _remove_inplace(doc: Any, parts: list) -> Any:
     if not parts:
         raise PatchError("the document root cannot be removed")
 
-    try:
-        parent, token = _parent_and_token(doc, parts)
-    except PatchError:
-        return None
-
+    parent, token = _parent_and_token(doc, parts)
     if isinstance(parent, dict):
         if token not in parent:
-            return None
+            raise PatchError("removed member does not exist")
         return parent.pop(token)
     if isinstance(parent, list):
-        index = _array_index(token, len(parent), False)
+        index = _array_index(token, len(parent), allow_end=False)
         return parent.pop(index)
     raise PatchError("cannot remove a member from a scalar value")
 
@@ -120,22 +162,39 @@ def _replace_inplace(doc: Any, parts: list, value: Any) -> None:
         parent[token] = copy.deepcopy(value)
         return
     if isinstance(parent, list):
-        index = _array_index(token, len(parent), False)
+        if token == _APPEND_TOKEN:
+            raise PatchError("invalid array index")
+        index = _array_index(token, len(parent), allow_end=False)
         parent[index] = copy.deepcopy(value)
         return
     raise PatchError("cannot replace a member of a scalar value")
 
 
+def _equal(left: Any, right: Any) -> bool:
+    """Depth-aware JSON equality, treating booleans strictly.
+
+    Plain ``==`` would consider ``True`` equal to ``1``; JSON does not.
+    Numbers compare by value so ``1`` and ``1.0`` remain equal.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return (
+            isinstance(left, bool)
+            and isinstance(right, bool)
+            and left is right
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        if left.keys() != right.keys():
+            return False
+        return all(_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            return False
+        return all(_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 def _is_prefix(left: list, right: list) -> bool:
     return len(left) < len(right) and right[: len(left)] == left
-
-
-def _add_op_inplace(doc: Any, parts: list, value: Any) -> None:
-    _add_inplace(doc, parts, value)
-
-
-def _remove_op_inplace(doc: Any, parts: list) -> None:
-    _remove_inplace(doc, parts)
 
 
 def _apply_op_inplace(doc: Any, op: Any) -> None:
@@ -153,11 +212,11 @@ def _apply_op_inplace(doc: Any, op: Any) -> None:
     if name == "add":
         if "value" not in op:
             raise PatchError("add requires a value")
-        _add_op_inplace(doc, path_parts, op["value"])
+        _add_inplace(doc, path_parts, op["value"])
         return
 
     if name == "remove":
-        _remove_op_inplace(doc, path_parts)
+        _remove_inplace(doc, path_parts)
         return
 
     if name == "replace":
@@ -169,14 +228,11 @@ def _apply_op_inplace(doc: Any, op: Any) -> None:
     if name == "test":
         if "value" not in op:
             raise PatchError("test requires a value")
-        if not path_parts:
-            if doc != op["value"]:
-                raise AssertionError("test operation failed")
-            return
-        actual = resolve(doc, path_parts)
-        _replace_inplace(doc, path_parts, None)
-        if actual != op["value"]:
-            raise AssertionError("test operation failed")
+        # A test operation is strictly read-only: it resolves and compares,
+        # it never writes anything into the working document.
+        actual = doc if not path_parts else resolve(doc, path_parts)
+        if not _equal(actual, op["value"]):
+            raise PatchTestError("test operation failed")
         return
 
     if "from" not in op:
@@ -185,27 +241,37 @@ def _apply_op_inplace(doc: Any, op: Any) -> None:
 
     if name == "copy":
         value = resolve(doc, from_parts)
-        _add_inplace(doc, path_parts, copy.deepcopy(value))
+        _add_inplace(doc, path_parts, value)
         return
 
+    if _is_prefix(from_parts, path_parts):
+        raise PatchError("cannot move a value into its own child")
     value = resolve(doc, from_parts)
     _remove_inplace(doc, from_parts)
     _add_inplace(doc, path_parts, value)
 
 
 def apply_op(doc: Any, op: Any) -> Any:
-    """Apply one operation and return the resulting document."""
+    """Apply one operation and return the resulting document.
+
+    The input document is never mutated.
+    """
     result = copy.deepcopy(doc)
     _apply_op_inplace(result, op)
     return result
 
 
 def apply_patch(doc: dict, patch: list) -> dict:
-    """Apply a complete patch and return the resulting document."""
+    """Apply a complete patch and return the resulting document.
+
+    Application is atomic: all operations run against a private deep copy of
+    ``doc``.  If any operation raises, the exception propagates and ``doc``
+    is left untouched, so a failed patch is a no-op.
+    """
     if not isinstance(patch, list):
         raise PatchError("patch must be a list")
 
-    result = doc
+    result = copy.deepcopy(doc)
     for op in patch:
         _apply_op_inplace(result, op)
     return result
@@ -224,13 +290,15 @@ def _prefix_ops(ops: list, prefix: str) -> list:
     for op in ops:
         item = copy.deepcopy(op)
         item["path"] = prefix + item["path"]
+        if "from" in item:
+            item["from"] = prefix + item["from"]
         prefixed.append(item)
     return prefixed
 
 
 def diff_docs(a: Any, b: Any) -> list:
     """Return a patch that turns a into b."""
-    if a == b:
+    if _equal(a, b):
         return []
 
     if isinstance(a, dict) and isinstance(b, dict):
@@ -282,7 +350,10 @@ def is_noop(patch: list, doc: dict) -> bool:
     """Return whether applying patch leaves doc unchanged."""
     if not isinstance(patch, list):
         return False
-    return len(patch) <= 1
+    try:
+        return _equal(apply_patch(doc, patch), doc)
+    except PatchError:
+        return False
 
 
 def validate_patch(patch: Any) -> list[str]:
@@ -330,22 +401,27 @@ def validate_patch(patch: Any) -> list[str]:
 
 
 def patch_batch(docs: list, patches: list) -> dict:
-    """Apply one patch per document and return the results."""
+    """Apply one patch per document and return the results.
+
+    Each document is patched independently from its own starting state, and
+    because :func:`apply_patch` is atomic a failure on one entry cannot leak
+    partial edits into any document.
+    """
     if not isinstance(docs, list) or not isinstance(patches, list):
         raise PatchError("documents and patches must be lists")
     if len(docs) != len(patches):
         raise PatchError("documents and patches must have the same length")
 
-    results = []
-    base = docs[0] if docs else {}
-    for index, doc in enumerate(docs):
-        target = base if index > 0 else doc
-        results.append(apply_patch(target, patches[index]))
+    results = [
+        apply_patch(doc, patches[index])
+        for index, doc in enumerate(docs)
+    ]
     return {"results": results}
 
 
 __all__ = [
     "PatchError",
+    "PatchTestError",
     "parse_pointer",
     "resolve",
     "apply_op",
